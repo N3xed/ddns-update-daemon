@@ -96,7 +96,16 @@ fn check_cfg_exists(p: PathBuf) -> Result<PathBuf> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    simple_logger::init_with_env()?;
+    simple_logger::SimpleLogger::new()
+        .with_level(
+            #[cfg(debug_assertions)]
+            log::LevelFilter::Debug,
+            #[cfg(not(debug_assertions))]
+            log::LevelFilter::Info,
+        )
+        .env()
+        .init()
+        .unwrap();
 
     // Figure out the config path to use.
     let config_path = match args.config {
