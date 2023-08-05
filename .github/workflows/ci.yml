@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+env:
+  rust_nightly_toolchain: nightly
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  compile:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - {
+            name: "Windows Latest",
+            os: windows-latest,
+            rust_toolchain: stable
+            more_checks: false
+          }
+        - {
+            name: "Ubuntu Latest",
+            os: ubuntu-latest,
+            rust_toolchain: stable-x86_64-unknown-linux-musl
+            more_checks: true
+          }
+        - {
+            name: "macOS Latest",
+            os: macos-latest,
+            rust_toolchain: stable
+            more_checks: false
+          }
+
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup | Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.config.rust_toolchain }}
+          components: rustfmt, clippy
+
+      - name: Build | Fmt Check
+        if: matrix.config.more_checks
+        run: cargo fmt -- --check
+
+      - name: Build | Clippy
+        if: matrix.config.more_checks
+        run: cargo clippy --no-deps -- -Dwarnings
+
+      - name: Build | Compile
+        run: cargo build
+
+      - name: Test
+        run: cargo test
