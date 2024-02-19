@@ -262,14 +262,14 @@ async fn main() -> anyhow::Result<()> {
 
 enum IpService {
     UPnP(UPnPIpService),
-    Local
+    Local,
 }
 
 impl IpService {
     async fn get_current_ips(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
         match self {
             IpService::UPnP(s) => s.get_current_ips().await,
-            IpService::Local => get_current_local_ips()
+            IpService::Local => get_current_local_ips(),
         }
     }
 }
