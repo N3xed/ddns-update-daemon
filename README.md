@@ -4,6 +4,8 @@ A dynamic DNS (ddns) daemon that uses [Universal Plug and
 Play](https://en.wikipedia.org/wiki/Universal_Plug_and_Play) (UPnP) to periodically check
 if the external IP address of the router changed, and if this is the case push an update
 to a ddns service.
+If `router_ip` is set to the loopback address `127.0.0.1`, the ddns-update-daemon will
+watch the local IP instead of the remote IP. In this case, no UPnP queries are sent.
 
 **Note**  
 Currently only [cloudflare](https://www.cloudflare.com/) is supported.
@@ -22,6 +24,8 @@ The configuration format is the following:
 interval = 30
 # The IP address of the internet gateway device the be queried. Optional.
 # If not specified, the first discovered internet gateway device will be used.
+# If set to loopback (127.0.0.1), the local IP address will be watched
+# by querying the OS of the current local IP address.
 router_ip = "192.168.1.1"
 
 # Cloudflare DNS records to update.

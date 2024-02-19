@@ -37,7 +37,11 @@ pub mod config {
         pub fn print(&self, path: &Path) {
             log::info!("Found config at '{}'", path.display());
             if let Some(ip) = &self.router_ip {
-                log::info!("Using configured router_ip '{ip}'")
+                if ip.is_loopback() {
+                    log::info!("Foud loopback as router_ip, watching local IP address instead.")
+                } else {
+                    log::info!("Using configured router_ip '{ip}'")
+                }
             } else {
                 log::info!("No router_ip configured, detecting from the network.")
             }
@@ -168,32 +172,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Discover the internet gateway device to be querried.
-    let service = ExtIpService::new_ip_connection_service(None).await?;
-    log::info!(
-        "Using router '{}' at '{}' to get external IP",
-        service.router_name(),
-        service.router_ip()
-    );
+    // let service = if config.
+    let service = if config
+        .router_ip
+        .as_ref()
+        .map(IpAddr::is_loopback)
+        .unwrap_or(false)
+    {
+        log::info!("Watching local IP address");
+        IpService::Local
+    } else {
+        let upnp_service = UPnPIpService::new_ip_connection_service(None).await?;
+        log::info!(
+            "Using router '{}' at '{}' to get external IP",
+            upnp_service.router_name(),
+            upnp_service.router_ip()
+        );
+        IpService::UPnP(upnp_service)
+    };
 
     let interval_duration = tokio::time::Duration::from_secs(config.interval * 60);
     let mut curr_ipv4: Option<Ipv4Addr> = None;
     let mut curr_ipv6: Option<Ipv6Addr> = None;
     loop {
-        let (next_ip, next_ipv6) = service.get_current_external_ips().await;
-        if next_ip.is_none() && next_ipv6.is_none() {
+        let (next_ipv4, next_ipv6) = service.get_current_ips().await;
+        if next_ipv4.is_none() && next_ipv6.is_none() {
             log::warn!("Both IPv4 and IPv6 unavailable, cannot update");
         } else {
-            let (ipv4, mut ipv6) = match next_ip {
-                Some(IpAddr::V4(addr)) => (Some(addr), None),
-                Some(IpAddr::V6(addr)) => (None, Some(addr)),
-                None => (None, None),
-            };
-            if next_ipv6.is_some() {
-                ipv6 = next_ipv6;
-            }
-
-            if curr_ipv4 != ipv4 && ipv4.is_some() {
-                let ipv4 = ipv4.unwrap();
+            if curr_ipv4 != next_ipv4 && next_ipv4.is_some() {
+                let ipv4 = next_ipv4.unwrap();
 
                 log::info!("Detected new IPv4 address '{ipv4}', updating..");
 
@@ -220,8 +227,8 @@ async fn main() -> anyhow::Result<()> {
                 curr_ipv4 = Some(ipv4);
             }
 
-            if curr_ipv6 != ipv6 && ipv6.is_some() {
-                let ipv6 = ipv6.unwrap();
+            if curr_ipv6 != next_ipv6 && next_ipv6.is_some() {
+                let ipv6 = next_ipv6.unwrap();
 
                 log::info!("Detected new IPv6 address '{ipv6}', updating..");
 
@@ -253,14 +260,28 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+enum IpService {
+    UPnP(UPnPIpService),
+    Local
+}
+
+impl IpService {
+    async fn get_current_ips(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+        match self {
+            IpService::UPnP(s) => s.get_current_ips().await,
+            IpService::Local => get_current_local_ips()
+        }
+    }
+}
+
 /// A service that queries the external IP address from the router using UPnP.
-pub struct ExtIpService {
+pub struct UPnPIpService {
     device: rupnp::Device,
     service_scpd: rupnp::scpd::SCPD,
     service: rupnp::Service,
 }
 
-impl ExtIpService {
+impl UPnPIpService {
     pub fn router_ip(&self) -> &str {
         self.device.url().host().unwrap()
     }
@@ -271,7 +292,7 @@ impl ExtIpService {
 
     /// Get the `WANIPConnection` service from the `InternetGatewayDevice` matching `ipaddr` using
     /// [UPnP WAN Common Interface Config](http://upnp.org/specs/gw/UPnP-gw-WANCommonInterfaceConfig-v1-Service.pdf).
-    async fn new_ip_connection_service(ipaddr: Option<std::net::IpAddr>) -> Result<ExtIpService> {
+    async fn new_ip_connection_service(ipaddr: Option<std::net::IpAddr>) -> Result<UPnPIpService> {
         const INTERNET_GATEWAY_DEVICE: URN =
             URN::device("schemas-upnp-org", "InternetGatewayDevice", 1);
         const WANIP_CON_SERVICE: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
@@ -330,7 +351,7 @@ impl ExtIpService {
 
         let service_scpd = service.scpd(gateway.url()).await?;
 
-        Ok(ExtIpService {
+        Ok(UPnPIpService {
             service: service.clone(),
             service_scpd,
             device: gateway,
@@ -392,24 +413,53 @@ impl ExtIpService {
         }
     }
 
-    pub async fn get_current_external_ips(&self) -> (Option<IpAddr>, Option<Ipv6Addr>) {
-        let ip = match self.get_current_external_ip().await {
-            Ok(ip) => Some(ip),
+    async fn get_current_ips(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+        let (ipv4, ipv6) = match self.get_current_external_ip().await {
+            Ok(IpAddr::V4(ip)) => (Some(ip), None),
+            Ok(IpAddr::V6(ip)) => (None, Some(ip)),
             Err(err) => {
                 log::error!("{err:?}");
-                None
+                (None, None)
             }
         };
-        let ipv6 = match self.get_current_external_ipv6().await {
-            Ok(ip) => ip,
-            Err(err) => {
-                log::error!("{err:?}");
-                None
+        let ipv6 = if let Some(_) = ipv6 {
+            ipv6
+        } else {
+            match self.get_current_external_ipv6().await {
+                Ok(ip) => ip,
+                Err(err) => {
+                    log::error!("{err:?}");
+                    None
+                }
             }
         };
 
-        (ip, ipv6)
+        (ipv4, ipv6)
     }
+}
+
+fn get_current_local_ips() -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    let (ipv4, ipv6) = match local_ip_address::local_ip() {
+        Ok(IpAddr::V4(ip)) => (Some(ip), None),
+        Ok(IpAddr::V6(ip)) => (None, Some(ip)),
+        Err(err) => {
+            log::error!("{err:?}");
+            (None, None)
+        }
+    };
+    let ipv6 = if let Some(_) = ipv6 {
+        ipv6
+    } else {
+        match local_ip_address::local_ipv6() {
+            Ok(IpAddr::V6(ip)) => Some(ip),
+            Ok(IpAddr::V4(_)) => None,
+            Err(err) => {
+                log::error!("{err:?}");
+                None
+            }
+        }
+    };
+    (ipv4, ipv6)
 }
 
 mod cloudflare_api {
