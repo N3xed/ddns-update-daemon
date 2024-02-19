@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Dominik Gschwind"]
 description = "DynDNS update daemon for cloudflare"
-rust-version = "1.76.0"
+rust-version = "1.75.0"
 
 [dependencies]
 rupnp = "1.1.0"
