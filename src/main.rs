@@ -422,7 +422,7 @@ impl UPnPIpService {
                 (None, None)
             }
         };
-        let ipv6 = if let Some(_) = ipv6 {
+        let ipv6 = if ipv6.is_some() {
             ipv6
         } else {
             match self.get_current_external_ipv6().await {
@@ -447,7 +447,7 @@ fn get_current_local_ips() -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
             (None, None)
         }
     };
-    let ipv6 = if let Some(_) = ipv6 {
+    let ipv6 = if ipv6.is_some() {
         ipv6
     } else {
         match local_ip_address::local_ipv6() {
