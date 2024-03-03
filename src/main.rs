@@ -11,7 +11,12 @@ use rupnp::ssdp::URN;
 mod cloudflare;
 mod url;
 
+/// A daemon for updating DynDNS services when the IP address changes.
+///
+/// Supports cloudflare, URL requests, and running programs on IP change.
+/// Please see https://github.com/N3xed/ddns-update-daemon for the configuration format.
 #[derive(clap::Parser)]
+#[command(version, about)]
 struct Args {
     /// The path to the `config.toml` file.
     /// If unset, `<current work dir>/config.toml` or `<exe dir>/config.toml` will be used
