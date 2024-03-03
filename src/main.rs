@@ -172,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Discover the internet gateway device to be querried.
-    // let service = if config.
     let service = if config
         .router_ip
         .as_ref()
@@ -182,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         log::info!("Watching local IP address");
         IpService::Local
     } else {
-        let upnp_service = UPnPIpService::new_ip_connection_service(None).await?;
+        let upnp_service = UPnPIpService::new_ip_connection_service(config.router_ip).await?;
         log::info!(
             "Using router '{}' at '{}' to get external IP",
             upnp_service.router_name(),
