@@ -8,7 +8,8 @@ use futures::pin_mut;
 use futures::prelude::*;
 use rupnp::ssdp::URN;
 
-use crate::config::DNSRecordType;
+mod cloudflare;
+mod url;
 
 #[derive(clap::Parser)]
 struct Args {
@@ -21,7 +22,7 @@ struct Args {
 pub mod config {
     use std::path::Path;
 
-    use crate::cloudflare_api;
+    use crate::{cloudflare, url};
 
     #[derive(Debug, serde::Deserialize)]
     pub struct Config {
@@ -31,61 +32,49 @@ pub mod config {
         pub interval: u64,
         /// The cloudflare DNS records to update.
         #[serde(default)]
-        pub cloudflare: Option<Cloudflare>,
+        pub cloudflare: Option<cloudflare::Cloudflare>,
+        /// Custom urls to send update requests to.
+        #[serde(default)]
+        pub urls: Vec<url::Url>,
+        /// Run one or more programs when new IP(s) are detected.
+        #[serde(default)]
+        pub runs: Vec<Run>,
     }
     impl Config {
         pub fn print(&self, path: &Path) {
             log::info!("Found config at '{}'", path.display());
             if let Some(ip) = &self.router_ip {
                 if ip.is_loopback() {
-                    log::info!("Foud loopback as router_ip, watching local IP address instead.")
+                    log::info!("Found loopback as router_ip, watching local IP address instead.")
                 } else {
-                    log::info!("Using configured router_ip '{ip}'")
+                    log::info!("Using configured router_ip '{ip}'.")
                 }
             } else {
                 log::info!("No router_ip configured, detecting from the network.")
             }
             if let Some(cf) = &self.cloudflare {
                 log::info!(
-                    "Found updater for cloudflare: {} DNS record(s)",
+                    "Found updater for cloudflare: {} DNS record(s).",
                     cf.records.len()
+                );
+            }
+            if !self.urls.is_empty() {
+                log::info!("Found updater for {} urls.", self.urls.len());
+            }
+            if !self.runs.is_empty() {
+                log::info!(
+                    "Found {} program(s) to be executed on IP change.",
+                    self.runs.len()
                 );
             }
         }
     }
 
-    #[derive(Debug, serde::Deserialize)]
-    pub struct Cloudflare {
-        /// Authentification for the cloudflaare API.
-        #[serde(flatten)]
-        pub auth: cloudflare_api::Auth,
-        /// Cloudflare DNS records to update.
-        pub records: Vec<CloudflareDNSRecord>,
-    }
-
     #[derive(Debug, serde::Deserialize, Clone)]
-    pub struct CloudflareDNSRecord {
-        /// The name of the DNS record to update.
-        pub name: String,
-        /// The DNS record type, currently supports `A` or `AAAA`.
-        #[serde(rename = "type")]
-        pub typ: DNSRecordType,
-    }
-
-    #[derive(
-        Debug,
-        serde::Deserialize,
-        serde::Serialize,
-        PartialEq,
-        Eq,
-        Clone,
-        Copy,
-        parse_display::Display,
-    )]
-    #[allow(clippy::upper_case_acronyms)]
-    pub enum DNSRecordType {
-        A,
-        AAAA,
+    pub struct Run {
+        /// The program to run and command line arguments,
+        /// `{ipv4}` and `{ipv6}` will be replaced with the detected IPs.
+        pub cmd: Vec<String>,
     }
 }
 
@@ -165,98 +154,181 @@ async fn main() -> anyhow::Result<()> {
 
     // Print information about the config.
     config.print(&config_path);
-    if config.cloudflare.is_none() {
+    if config.cloudflare.is_none() && config.urls.is_empty() && config.runs.is_empty() {
         log::warn!("Nothing to update: no updaters defined");
         log::info!("Exiting.");
         return Ok(());
     }
 
-    // Discover the internet gateway device to be querried.
-    let service = if config
-        .router_ip
-        .as_ref()
-        .map(IpAddr::is_loopback)
-        .unwrap_or(false)
-    {
-        log::info!("Watching local IP address");
+    let config::Config {
+        router_ip,
+        interval,
+        cloudflare: cf,
+        mut urls,
+        runs,
+    } = config;
+
+    // Discover the internet gateway device to be querried or watch the local ip
+    // if loopback.
+    let service = if router_ip.as_ref().map(IpAddr::is_loopback).unwrap_or(false) {
+        log::info!("Watching local IP address.");
         IpService::Local
     } else {
-        let upnp_service = UPnPIpService::new_ip_connection_service(config.router_ip).await?;
+        let upnp_service = UPnPIpService::new_ip_connection_service(router_ip).await?;
         log::info!(
-            "Using router '{}' at '{}' to get external IP",
+            "Using router '{}' at '{}' to get external IP.",
             upnp_service.router_name(),
             upnp_service.router_ip()
         );
         IpService::UPnP(upnp_service)
     };
 
-    let interval_duration = tokio::time::Duration::from_secs(config.interval * 60);
+    let (cf_auth, mut cf_updaters) = if let Some(cf) = cf {
+        let updaters = cf
+            .records
+            .into_iter()
+            .map(cloudflare::CloudflareUpdater::new)
+            .collect();
+        (Some(cf.auth), updaters)
+    } else {
+        (None, Vec::new())
+    };
+
+    let interval = tokio::time::Duration::from_secs(interval * 60);
     let mut curr_ipv4: Option<Ipv4Addr> = None;
     let mut curr_ipv6: Option<Ipv6Addr> = None;
     loop {
         let (next_ipv4, next_ipv6) = service.get_current_ips().await;
-        if next_ipv4.is_none() && next_ipv6.is_none() {
-            log::warn!("Both IPv4 and IPv6 unavailable, cannot update");
-        } else {
-            if curr_ipv4 != next_ipv4 && next_ipv4.is_some() {
-                let ipv4 = next_ipv4.unwrap();
 
-                log::info!("Detected new IPv4 address '{ipv4}', updating..");
-
-                // Update cloudflare IPv4 DNS records.
-                if let Some(cf) = &config.cloudflare {
-                    for record in cf.records.iter().filter(|r| r.typ == DNSRecordType::A) {
-                        let upd_record = cloudflare_api::DNSRecord {
-                            name: record.name.clone(),
-                            typ: record.typ,
-                            content: ipv4.to_string(),
-                        };
-
-                        if let Err(err) = cloudflare_api::update_dns_record(&cf.auth, &upd_record)
-                            .await
-                            .with_context(|| {
-                                anyhow!("could not update cloudflare DNS record '{}'", &record.name)
-                            })
-                        {
-                            log::error!("{err:?}");
-                        }
-                    }
-                }
-
-                curr_ipv4 = Some(ipv4);
+        let ipv4_changed = curr_ipv4 != next_ipv4;
+        let ipv6_changed = curr_ipv6 != next_ipv6;
+        let ip_changed = ipv4_changed || ipv6_changed;
+        match (&next_ipv4, &next_ipv6) {
+            (None, None) => {
+                log::warn!("Both IPv4 and IPv6 unavailable.");
             }
+            (Some(ipv4), None) if ip_changed => {
+                log::info!("IP changed: IPv4={ipv4}, IPv6=unavailable. Updating..");
+            }
+            (None, Some(ipv6)) if ip_changed => {
+                log::info!("IP changed: IPv4=unavailable, IPv6={ipv6}. Updating..");
+            }
+            (Some(ipv4), Some(ipv6)) if ip_changed => {
+                log::info!("IP changed: IPv4={ipv4}, IPv6={ipv6}. Updating..");
+            }
+            _ => {}
+        }
 
-            if curr_ipv6 != next_ipv6 && next_ipv6.is_some() {
-                let ipv6 = next_ipv6.unwrap();
+        if cf_auth.is_some() || !urls.is_empty() {
+            let client = reqwest::Client::builder().build();
+            match client {
+                Ok(client) => {
+                    // Update cloudflare.
+                    if let Some(cf_auth) = &cf_auth {
+                        for updater in &mut cf_updaters {
+                            let (ip, new_ip) = if updater.is_ipv4() {
+                                // Do not update if no IP is available.
+                                let Some(ipv4) = next_ipv4 else { continue };
+                                (IpAddr::V4(ipv4), ipv4_changed)
+                            } else {
+                                // Do not update if no IP is available.
+                                let Some(ipv6) = next_ipv6 else { continue };
+                                (IpAddr::V6(ipv6), ipv6_changed)
+                            };
 
-                log::info!("Detected new IPv6 address '{ipv6}', updating..");
+                            log::debug!("Updating cloudflare DNS record '{}'", updater.name());
+                            let res = updater
+                                .update(cf_auth, ip, new_ip, &client)
+                                .await
+                                .with_context(|| {
+                                    anyhow!(
+                                        "could not update cloudflare DNS record '{}'",
+                                        updater.name()
+                                    )
+                                });
 
-                // Update cloudflare IPv6 DNS records.
-                if let Some(cf) = &config.cloudflare {
-                    for record in cf.records.iter().filter(|r| r.typ == DNSRecordType::AAAA) {
-                        let upd_record = cloudflare_api::DNSRecord {
-                            name: record.name.clone(),
-                            typ: record.typ,
-                            content: ipv6.to_string(),
-                        };
+                            if let Err(err) = res {
+                                log::error!("{:?}", err);
+                            }
+                        }
+                    }
 
-                        if let Err(err) = cloudflare_api::update_dns_record(&cf.auth, &upd_record)
-                            .await
-                            .with_context(|| {
-                                anyhow!("could not update cloudflare DNS record '{}'", &record.name)
-                            })
-                        {
-                            log::error!("{err:?}");
+                    if !urls.is_empty() {
+                        let ipv4 = next_ipv4
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        let ipv6 = next_ipv6
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+
+                        // Update urls.
+                        for (i, url) in urls.iter_mut().enumerate() {
+                            log::debug!("Updating url {i} ('{}')", url.name());
+                            let res = url
+                                .update(&ipv4, &ipv6, ip_changed, &client)
+                                .await
+                                .with_context(|| {
+                                    anyhow!("updating url {i} ('{}') failed", url.name())
+                                });
+
+                            if let Err(err) = res {
+                                log::error!("{:?}", err);
+                            }
                         }
                     }
                 }
-
-                curr_ipv6 = Some(ipv6);
+                Err(err) => {
+                    log::error!("Failed to initialize HTTP request backend: {:?}", err);
+                }
             }
         }
 
-        tokio::time::sleep(interval_duration).await;
+        if ip_changed {
+            let ipv4 = next_ipv4
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let ipv6 = next_ipv6
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+
+            let mut handles = Vec::with_capacity(runs.len());
+            for run in &runs {
+                if run.cmd.is_empty() {
+                    continue;
+                }
+                let args: Vec<String> = run
+                    .cmd
+                    .iter()
+                    .skip(1)
+                    .map(|arg| replace_placehoders(arg, &ipv4, &ipv6))
+                    .collect();
+                match std::process::Command::new(&run.cmd[0]).args(args).spawn() {
+                    Err(err) => {
+                        log::error!("Could not launch '{}': {:?}", run.cmd[0], err);
+                    }
+                    Ok(h) => handles.push(h),
+                }
+            }
+
+            for mut h in handles {
+                // Ignore the command result.
+                let _ = h.wait();
+            }
+        }
+
+        curr_ipv4 = next_ipv4;
+        curr_ipv6 = next_ipv6;
+        tokio::time::sleep(interval).await;
     }
+}
+
+pub fn replace_placehoders(s: &str, ipv4: &str, ipv6: &str) -> String {
+    let s = s.replace("{ipv4}", ipv4);
+    s.replace("{ipv6}", ipv6)
 }
 
 enum IpService {
@@ -312,6 +384,11 @@ impl UPnPIpService {
                 None => bail!("could not find internet gateway device"),
             };
 
+            log::debug!(
+                "Found gateway '{}' at '{}'",
+                gateway.friendly_name(),
+                gateway.url()
+            );
             if let Some(gateway_ip) = &ipaddr {
                 if let Some(mut host) = gateway.url().host() {
                     host = host.strip_prefix('[').unwrap_or(host);
@@ -459,150 +536,4 @@ fn get_current_local_ips() -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
         }
     };
     (ipv4, ipv6)
-}
-
-mod cloudflare_api {
-    use anyhow::{anyhow, bail, Context, Result};
-    use reqwest::Client;
-
-    use crate::DNSRecordType;
-
-    #[derive(Debug, serde::Serialize, serde::Deserialize)]
-    pub struct Auth {
-        /// The zone ID of the cloudflare site.
-        pub zone_id: String,
-        /// The cloudflare API access token.
-        pub api_token: String,
-    }
-
-    #[derive(Debug, serde::Serialize)]
-    pub struct DNSRecord {
-        pub content: String,
-        #[serde(serialize_with = "serialize_punycode")]
-        pub name: String,
-        #[serde(rename = "type")]
-        pub typ: DNSRecordType,
-    }
-
-    pub fn encode_punycode(val: &str) -> Result<String> {
-        idna::domain_to_ascii(val).with_context(|| anyhow!("could not encode '{val}' in punycode"))
-    }
-
-    pub fn serialize_punycode<S>(val: &str, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let s = encode_punycode(val).map_err(|err| serde::ser::Error::custom(format!("{err}")))?;
-        ser.serialize_str(&s)
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    #[allow(dead_code)]
-    struct DnsApiResponse {
-        #[serde(default)]
-        success: bool,
-        #[serde(default)]
-        errors: Vec<Message>,
-        #[serde(default)]
-        messages: Vec<Message>,
-        #[serde(default)]
-        result: Option<DnsApiResult>,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    #[allow(dead_code)]
-    struct Message {
-        code: i64,
-        message: String,
-    }
-
-    #[derive(serde::Deserialize, Debug)]
-    #[serde(untagged)]
-    enum DnsApiResult {
-        List(Vec<ListRecordsResult>),
-        Patch {},
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct ListRecordsResult {
-        id: String,
-    }
-
-    pub async fn update_dns_record(auth: &Auth, dns_record: &DNSRecord) -> Result<()> {
-        let Auth { zone_id, api_token } = auth;
-
-        let (client, request) = Client::new()
-            .get(format!(
-                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-            ))
-            .bearer_auth(api_token)
-            .query(&[
-                ("name", &encode_punycode(&dns_record.name)?),
-                ("type", &dns_record.typ.to_string()),
-            ])
-            .build_split();
-        let resp = client.execute(request?).await?;
-        let data = check_reponse(resp, None)
-            .await?
-            .ok_or_else(|| anyhow!("empty cloudflare response"))?;
-
-        let ListRecordsResult { id } = match data.result {
-            Some(DnsApiResult::List(mut res)) if !res.is_empty() => res.swap_remove(0),
-            _ => {
-                bail!(
-                    "no DNS records matched name '{}' and type '{}'",
-                    dns_record.name,
-                    dns_record.typ
-                );
-            }
-        };
-
-        let resp = client
-            .patch(format!(
-                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{id}"
-            ))
-            .bearer_auth(api_token)
-            .json(&dns_record)
-            .send()
-            .await?;
-
-        check_reponse(resp, Some(dns_record)).await?;
-        Ok(())
-    }
-
-    async fn check_reponse(
-        resp: reqwest::Response,
-        dns_record: Option<&DNSRecord>,
-    ) -> Result<Option<DnsApiResponse>> {
-        let resp_status = resp.status();
-        let res_err = resp.error_for_status_ref().err();
-        let data: Option<DnsApiResponse> = match resp.json().await {
-            Err(err) => {
-                return Err(anyhow::Error::from(err).context("could not get cloudflare response"));
-            }
-            Ok(d) => d,
-        };
-
-        if !data.as_ref().map(|d| d.success).unwrap_or(false) || res_err.is_some() {
-            let error = if let Some(err) = res_err {
-                anyhow::Error::new(err)
-            } else {
-                anyhow!("cloudflare API call failed")
-            };
-            let mut err_text = String::new();
-            if let Some(dns_record) = dns_record {
-                err_text.push_str(&format!(
-                    "when sending data:\n{}",
-                    serde_json::to_string_pretty(&dns_record).unwrap()
-                ));
-            }
-            if let Some(data) = data {
-                err_text.push_str(&format!(
-                    "\ncloudflare responded with {resp_status}: {data:#?}"
-                ))
-            }
-            return Err(anyhow!(err_text).context(error));
-        }
-        Ok(data)
-    }
 }

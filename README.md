@@ -3,12 +3,17 @@
 A dynamic DNS (ddns) daemon that uses [Universal Plug and
 Play](https://en.wikipedia.org/wiki/Universal_Plug_and_Play) (UPnP) to periodically check
 if the external IP address of the router changed, and if this is the case push an update
-to a ddns service.
+to a ddns service or run a program.
+
 If `router_ip` is set to the loopback address `127.0.0.1`, the ddns-update-daemon will
 watch the local IP instead of the remote IP. In this case, no UPnP queries are sent.
 
-**Note**  
-Currently only [cloudflare](https://www.cloudflare.com/) is supported.
+Runs on Linux, Windows and Mac.
+
+**Supports**
+- [Cloudflare](https://www.cloudflare.com/) by using the cloudflare API to update DNS records.
+- Requests to custom URLs (e.g. for dynu, no-ip, etc.).
+- Running a program.
 
 ## Configuration
 
@@ -42,4 +47,31 @@ name = "@"
 # The type of the DNS record. Required.
 # Supportes "A" or "AAAA" records.
 type = "A" # or "AAAA"
+
+# Update a DynDNS service with a request to a URL.
+[[urls]]
+# The method used for the update request, supports "get", "post", "put", "patch", ...
+# Defaults to "get".
+method = "get"
+
+# The url to send the update request to, placeholders `{ipv4}` and `{ipv6}`
+# will get replaced by the IPv4 and IPv6 address that was detected.
+# Required.
+url = "https://api.yourservice.com/nic/update?myip={ipv4}&myipv6={ipv6}"
+
+# Additional headers to send, placeholders `{ipv4}` and `{ipv6}` will be replaced
+# with the detected IPs in the header values.
+# Optional.
+headers = {"name" = "value", ...}
+
+# The body of the request, if the request supports a body.
+# Placeholders `{ipv4}` and `{ipv6}` will again be replaced by the detected IPs.
+# Optional.
+body = ""
+
+# Run one or more programs when new IP(s) are detected.
+[[runs]]
+# The program to run and command line arguments,
+# `{ipv4}` and `{ipv6}` will be replaced with the detected IPs in the arguments.
+cmd = ["myprog", "{ipv4}"]
 ```
