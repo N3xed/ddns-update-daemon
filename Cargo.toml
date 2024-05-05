@@ -1,6 +1,6 @@
 [package]
 name = "ddns-update-daemon"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Dominik Gschwind"]
 description = "DynDNS update daemon using UPnP"
@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 rupnp = "2.0.0"
 anyhow = "1.0"
 parse-display = "0.9"
-tokio = { version = "1.29", features = ["macros"] }
+tokio = { version = "1.29", features = ["macros", "rt", "time"] }
 reqwest = { version = "0.12", features = ["json", "charset", "http2", "macos-system-configuration"], default-features = false }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }

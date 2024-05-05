@@ -86,7 +86,7 @@ pub mod config {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     simple_logger::SimpleLogger::new()
         .with_level(if args.verbose {
@@ -165,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
     let mut curr_ipv6: Option<Ipv6Addr> = None;
     loop {
         let (next_ipv4, next_ipv6) = match service.get_current_ips().await {
-            Ok(v) => v,
-            Err(_) => {
+            Some(v) => v,
+            None => {
                 log::info!("UPnP request failed; rediscovering internet gateway..");
                 // Try to recreate the IpService, since the previous call errored.
                 let new_service = IpService::new(config.router_ip, false).await;
@@ -305,18 +305,18 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-pub fn replace_placehoders(s: &str, ipv4: &str, ipv6: &str) -> String {
+fn replace_placehoders(s: &str, ipv4: &str, ipv6: &str) -> String {
     let s = s.replace("{ipv4}", ipv4);
     s.replace("{ipv6}", ipv6)
 }
 
-enum IpService {
+pub enum IpService {
     UPnP(UPnPIpService),
     Local,
 }
 
 impl IpService {
-    async fn get_current_ips(&self) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
+    pub async fn get_current_ips(&self) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         match self {
             IpService::UPnP(s) => s.get_current_ips().await,
             IpService::Local => get_current_local_ips(),
@@ -326,7 +326,7 @@ impl IpService {
     /// Create an IP address service.
     /// Query local IP address if `ipaddr` is loopback otherwise use UPnP to
     /// query the router's given by `ipaddr` or the first discovered.
-    async fn new(ipaddr: Option<std::net::IpAddr>, verbose: bool) -> Result<Self> {
+    pub async fn new(ipaddr: Option<std::net::IpAddr>, verbose: bool) -> Result<Self> {
         if ipaddr.as_ref().map(IpAddr::is_loopback).unwrap_or(false) {
             if verbose {
                 log::info!("Watching the local IP address.");
@@ -434,7 +434,7 @@ impl UPnPIpService {
     }
 
     /// Get the external ip address.
-    pub async fn get_current_external_ip(&self) -> Result<Option<IpAddr>> {
+    async fn get_current_external_ip(&self) -> Result<Option<IpAddr>> {
         const ACTION: &str = "GetExternalIPAddress";
         const IPV4_ADDR_VAR: &str = "NewExternalIPAddress";
 
@@ -455,7 +455,7 @@ impl UPnPIpService {
 
     /// Get the external IPV6 address. Currently only supported on FRITZ!Box with the
     /// `X_AVM_DE_GetExternalIPv6Address` action.
-    pub async fn get_current_external_ipv6(&self) -> Result<Option<Ipv6Addr>> {
+    async fn get_current_external_ipv6(&self) -> Result<Option<Ipv6Addr>> {
         const ACTION: &str = "X_AVM_DE_GetExternalIPv6Address";
         const IPV6_ADDR_VAR: &str = "NewExternalIPv6Address";
         const VALID_LIFETIME_VAR: &str = "NewValidLifetime";
@@ -493,14 +493,14 @@ impl UPnPIpService {
         }
     }
 
-    async fn get_current_ips(&self) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
+    pub async fn get_current_ips(&self) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         let (ipv4, ipv6) = match self.get_current_external_ip().await {
             Ok(Some(IpAddr::V4(ip))) => (Some(ip), None),
             Ok(Some(IpAddr::V6(ip))) => (None, Some(ip)),
             Ok(None) => (None, None),
             Err(err) => {
                 log::error!("{err:?}");
-                return Err(());
+                return None;
             }
         };
         let ipv6 = if ipv6.is_some() {
@@ -510,16 +510,16 @@ impl UPnPIpService {
                 Ok(ip) => ip,
                 Err(err) => {
                     log::error!("{err:?}");
-                    return Err(());
+                    return None;
                 }
             }
         };
 
-        Ok((ipv4, ipv6))
+        Some((ipv4, ipv6))
     }
 }
 
-fn get_current_local_ips() -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
+pub fn get_current_local_ips() -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
     let (ipv4, ipv6) = match local_ip_address::local_ip() {
         Ok(IpAddr::V4(ip)) => (Some(ip), None),
         Ok(IpAddr::V6(ip)) => (None, Some(ip)),
@@ -540,5 +540,5 @@ fn get_current_local_ips() -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
             }
         }
     };
-    Ok((ipv4, ipv6))
+    Some((ipv4, ipv6))
 }
