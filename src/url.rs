@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rupnp::http::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 use crate::replace_placehoders;
