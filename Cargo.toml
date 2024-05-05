@@ -3,8 +3,12 @@ name = "ddns-update-daemon"
 version = "0.3.0"
 edition = "2021"
 authors = ["Dominik Gschwind"]
-description = "DynDNS update daemon"
+description = "DynDNS update daemon using UPnP"
 rust-version = "1.75.0"
+repository = "https://github.com/N3xed/ddns-update-daemon"
+license = "MIT"
+keywords = ["ddns", "upnp", "cloudflare", "dns"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 rupnp = "2.0.0"

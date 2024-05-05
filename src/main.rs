@@ -19,9 +19,10 @@ mod url;
 #[command(version, about)]
 struct Args {
     /// The path to the `config.toml` file.
-    /// If unset, `<current work dir>/config.toml` or `<exe dir>/config.toml` will be used
-    /// (in that order).
-    config: Option<PathBuf>,
+    config: PathBuf,
+    /// Enable verbose logging.
+    #[clap(short, long)]
+    verbose: bool,
 }
 
 pub mod config {
@@ -33,8 +34,9 @@ pub mod config {
     pub struct Config {
         /// Optional router IP address that will be used to query the external IP address using UPnP.
         pub router_ip: Option<std::net::IpAddr>,
-        /// The interval in minutes to check if the external ip changed.
-        pub interval: u64,
+        /// The interval in minutes to check if the IP address changed.
+        /// May be fractional (i.e. `0.5`).
+        pub interval: f64,
         /// The cloudflare DNS records to update.
         #[serde(default)]
         pub cloudflare: Option<cloudflare::Cloudflare>,
@@ -68,7 +70,7 @@ pub mod config {
             }
             if !self.runs.is_empty() {
                 log::info!(
-                    "Found {} program(s) to be executed on IP change.",
+                    "Found {} program(s) to be executed on IP address change.",
                     self.runs.len()
                 );
             }
@@ -83,72 +85,34 @@ pub mod config {
     }
 }
 
-fn check_cfg_exists(p: PathBuf) -> Result<PathBuf> {
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(anyhow!("config.toml file '{}' does not exist", p.display()))
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     simple_logger::SimpleLogger::new()
-        .with_level(
-            #[cfg(debug_assertions)]
-            log::LevelFilter::Debug,
-            #[cfg(not(debug_assertions))]
-            log::LevelFilter::Info,
-        )
-        .env()
+        .with_level(if args.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
         .init()
         .unwrap();
 
     // Figure out the config path to use.
-    let config_path = match args.config {
-        Some(mut p) => {
-            if p.is_relative() {
-                if let Ok(cwd) = std::env::current_dir() {
-                    p = cwd.join(p);
-                }
-            }
+    let config_path = {
+        let cfg = match std::env::current_dir() {
+            Ok(cwd) if args.config.is_relative() => cwd.join(args.config),
+            _ => args.config,
+        };
 
-            check_cfg_exists(p)?
+        if cfg.exists() {
+            Ok(cfg)
+        } else {
+            Err(anyhow!(
+                "config.toml file '{}' does not exist",
+                cfg.display()
+            ))
         }
-        None => {
-            let cwd_cfg = std::env::current_dir()
-                .map_err(anyhow::Error::from)
-                .map(|p| p.join("config.toml"))
-                .and_then(check_cfg_exists);
-
-            if let Ok(p) = cwd_cfg {
-                p
-            } else {
-                let pd_cfg = std::env::current_exe()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|p| {
-                        let dir = p.parent().with_context(|| {
-                            anyhow!("path '{}' does not have parent", p.display())
-                        })?;
-                        let cfg = dir.join("config.toml");
-                        check_cfg_exists(cfg)
-                    });
-
-                if let Ok(p) = pd_cfg {
-                    p
-                } else {
-                    log::info!(
-                        "could not get config.toml from current work dir: {:?}",
-                        cwd_cfg.unwrap_err()
-                    );
-                    return Err(pd_cfg
-                        .unwrap_err()
-                        .context(anyhow!("could not get config.toml from executable dir")));
-                }
-            }
-        }
-    };
+    }?;
 
     // Deserialize the config.
     let config: config::Config = toml::from_str(
@@ -175,18 +139,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Discover the internet gateway device to be querried or watch the local ip
     // if loopback.
-    let service = if router_ip.as_ref().map(IpAddr::is_loopback).unwrap_or(false) {
-        log::info!("Watching local IP address.");
-        IpService::Local
-    } else {
-        let upnp_service = UPnPIpService::new_ip_connection_service(router_ip).await?;
-        log::info!(
-            "Using router '{}' at '{}' to get external IP.",
-            upnp_service.router_name(),
-            upnp_service.router_ip()
-        );
-        IpService::UPnP(upnp_service)
-    };
+    log::info!("Discovering internet gateway..");
+    let mut service = IpService::new(router_ip, true).await?;
 
     let (cf_auth, mut cf_updaters) = if let Some(cf) = cf {
         let updaters = cf
@@ -199,11 +153,29 @@ async fn main() -> anyhow::Result<()> {
         (None, Vec::new())
     };
 
-    let interval = tokio::time::Duration::from_secs(interval * 60);
+    let interval = (interval * 60.0).round();
+    anyhow::ensure!(
+        interval >= 0.0 && interval.is_finite() && interval <= u64::MAX as f64,
+        "interval * 60 ({interval}) must be positive and less than `2^64 - 1`"
+    );
+    log::info!("Using {interval} seconds interval.");
+
+    let interval = tokio::time::Duration::from_secs(interval as u64);
     let mut curr_ipv4: Option<Ipv4Addr> = None;
     let mut curr_ipv6: Option<Ipv6Addr> = None;
     loop {
-        let (next_ipv4, next_ipv6) = service.get_current_ips().await;
+        let (next_ipv4, next_ipv6) = match service.get_current_ips().await {
+            Ok(v) => v,
+            Err(_) => {
+                log::info!("UPnP request failed; rediscovering internet gateway..");
+                // Try to recreate the IpService, since the previous call errored.
+                let new_service = IpService::new(config.router_ip, false).await;
+                if let Ok(new_service) = new_service {
+                    service = new_service;
+                }
+                (None, None)
+            }
+        };
 
         let ipv4_changed = curr_ipv4 != next_ipv4;
         let ipv6_changed = curr_ipv6 != next_ipv6;
@@ -213,15 +185,17 @@ async fn main() -> anyhow::Result<()> {
                 log::warn!("Both IPv4 and IPv6 unavailable.");
             }
             (Some(ipv4), None) if ip_changed => {
-                log::info!("IP changed: IPv4={ipv4}, IPv6=unavailable. Updating..");
+                log::info!("IP address changed: IPv4={ipv4}, IPv6=unavailable. Updating..");
             }
             (None, Some(ipv6)) if ip_changed => {
-                log::info!("IP changed: IPv4=unavailable, IPv6={ipv6}. Updating..");
+                log::info!("IP address changed: IPv4=unavailable, IPv6={ipv6}. Updating..");
             }
             (Some(ipv4), Some(ipv6)) if ip_changed => {
-                log::info!("IP changed: IPv4={ipv4}, IPv6={ipv6}. Updating..");
+                log::info!("IP address changed: IPv4={ipv4}, IPv6={ipv6}. Updating..");
             }
-            _ => {}
+            (ipv4, ipv6) => {
+                log::debug!("IP address no change:  IPv4={ipv4:?}, IPv6={ipv6:?}");
+            }
         }
 
         if cf_auth.is_some() || !urls.is_empty() {
@@ -342,10 +316,30 @@ enum IpService {
 }
 
 impl IpService {
-    async fn get_current_ips(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    async fn get_current_ips(&self) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
         match self {
             IpService::UPnP(s) => s.get_current_ips().await,
             IpService::Local => get_current_local_ips(),
+        }
+    }
+
+    /// Create an IP address service.
+    /// Query local IP address if `ipaddr` is loopback otherwise use UPnP to
+    /// query the router's given by `ipaddr` or the first discovered.
+    async fn new(ipaddr: Option<std::net::IpAddr>, verbose: bool) -> Result<Self> {
+        if ipaddr.as_ref().map(IpAddr::is_loopback).unwrap_or(false) {
+            if verbose {
+                log::info!("Watching the local IP address.");
+            }
+            Ok(IpService::Local)
+        } else {
+            let upnp_service = UPnPIpService::new_ip_connection_service(ipaddr).await?;
+            log::info!(
+                "Using router '{}' at '{}' to get the external IP address.",
+                upnp_service.router_name(),
+                upnp_service.router_ip()
+            );
+            Ok(IpService::UPnP(upnp_service))
         }
     }
 }
@@ -440,7 +434,7 @@ impl UPnPIpService {
     }
 
     /// Get the external ip address.
-    pub async fn get_current_external_ip(&self) -> Result<IpAddr> {
+    pub async fn get_current_external_ip(&self) -> Result<Option<IpAddr>> {
         const ACTION: &str = "GetExternalIPAddress";
         const IPV4_ADDR_VAR: &str = "NewExternalIPAddress";
 
@@ -449,11 +443,14 @@ impl UPnPIpService {
             Ok(r) => r,
         };
 
-        let ip_addr_str = response
-            .get(IPV4_ADDR_VAR)
-            .with_context(|| anyhow!("{ACTION} gave empty response"))?;
+        let Some(ip_addr_str) = response.get(IPV4_ADDR_VAR) else {
+            return Ok(None);
+        };
+        if ip_addr_str.trim().is_empty() {
+            return Ok(None);
+        }
 
-        Ok(ip_addr_str.parse()?)
+        Ok(Some(ip_addr_str.parse()?))
     }
 
     /// Get the external IPV6 address. Currently only supported on FRITZ!Box with the
@@ -479,10 +476,12 @@ impl UPnPIpService {
 
         let valid_lifetime = match response.get(VALID_LIFETIME_VAR) {
             None => return Ok(None),
+            Some(v) if v.trim().is_empty() => return Ok(None),
             Some(v) => v,
         };
         let ipv6_addr = match response.get(IPV6_ADDR_VAR) {
             None => return Ok(None),
+            Some(v) if v.trim().is_empty() => return Ok(None),
             Some(v) => v,
         };
 
@@ -494,13 +493,14 @@ impl UPnPIpService {
         }
     }
 
-    async fn get_current_ips(&self) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    async fn get_current_ips(&self) -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
         let (ipv4, ipv6) = match self.get_current_external_ip().await {
-            Ok(IpAddr::V4(ip)) => (Some(ip), None),
-            Ok(IpAddr::V6(ip)) => (None, Some(ip)),
+            Ok(Some(IpAddr::V4(ip))) => (Some(ip), None),
+            Ok(Some(IpAddr::V6(ip))) => (None, Some(ip)),
+            Ok(None) => (None, None),
             Err(err) => {
                 log::error!("{err:?}");
-                (None, None)
+                return Err(());
             }
         };
         let ipv6 = if ipv6.is_some() {
@@ -510,16 +510,16 @@ impl UPnPIpService {
                 Ok(ip) => ip,
                 Err(err) => {
                     log::error!("{err:?}");
-                    None
+                    return Err(());
                 }
             }
         };
 
-        (ipv4, ipv6)
+        Ok((ipv4, ipv6))
     }
 }
 
-fn get_current_local_ips() -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+fn get_current_local_ips() -> Result<(Option<Ipv4Addr>, Option<Ipv6Addr>), ()> {
     let (ipv4, ipv6) = match local_ip_address::local_ip() {
         Ok(IpAddr::V4(ip)) => (Some(ip), None),
         Ok(IpAddr::V6(ip)) => (None, Some(ip)),
@@ -540,5 +540,5 @@ fn get_current_local_ips() -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
             }
         }
     };
-    (ipv4, ipv6)
+    Ok((ipv4, ipv6))
 }
