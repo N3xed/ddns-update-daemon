@@ -46,7 +46,10 @@ pub mod config {
     }
 
     #[derive(Debug, serde::Deserialize, Clone)]
-    #[serde(untagged, expecting = "an IP address or a UPnP InternetGatewayDevice endpoint URI")]
+    #[serde(
+        untagged,
+        expecting = "an IP address or a UPnP InternetGatewayDevice endpoint URI"
+    )]
     pub enum Router {
         Ip(std::net::IpAddr),
         Uri(Uri),
