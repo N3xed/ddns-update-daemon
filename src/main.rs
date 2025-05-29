@@ -343,6 +343,7 @@ fn replace_placehoders(s: &str, ipv4: &str, ipv6: &str) -> String {
     s.replace("{ipv6}", ipv6)
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum IpService {
     UPnP(UPnPIpService),
     Local,
