@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use upnp::UPnPIpService;
 
@@ -88,7 +88,9 @@ pub mod config {
                     log::info!("Using configured router_ip '{ip}'.")
                 }
                 Some(Router::Uri(Uri(uri))) => {
-                    log::info!("Using configured router_ip `{uri}` as UPnP InternetGatewayDevice endpoint.");
+                    log::info!(
+                        "Using configured router_ip `{uri}` as UPnP InternetGatewayDevice endpoint."
+                    );
                 }
             }
 

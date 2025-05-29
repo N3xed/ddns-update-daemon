@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
 
 #[derive(Debug, serde::Deserialize)]

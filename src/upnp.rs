@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::pin_mut;
 use futures::prelude::*;
 use rupnp::http::Uri;
@@ -144,7 +144,9 @@ impl UPnPIpService {
                         Err(err) => {
                             let uri = gateway.url();
                             let device_name = gateway.friendly_name();
-                            log::info!("Uri '{uri}' of discovered gateway '{device_name}' is not a valid IP address: {err:?}");
+                            log::info!(
+                                "Uri '{uri}' of discovered gateway '{device_name}' is not a valid IP address: {err:?}"
+                            );
                             continue;
                         }
                     };
