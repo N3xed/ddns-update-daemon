@@ -45,6 +45,9 @@ interval = 30
 # If not specified, the first discovered internet gateway device will be used.
 # If set to loopback (127.0.0.1), the local IP address will be watched
 # by querying the OS of the current local IP address.
+# Can also be set to the UPnP InternetGatewayDevice endpoint URI (e.g.
+# "http://192.168.1.1:49000/igd2desc.xml", it is printed in verbose mode with `-v`),
+# in which case the network discovering step will be skipped.
 router_ip = "192.168.1.1"
 
 # Cloudflare DNS records to update. Optional.
