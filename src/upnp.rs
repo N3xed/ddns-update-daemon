@@ -247,7 +247,15 @@ impl UPnPIpService {
         let ipv6 = if ipv6.is_some() {
             ipv6
         } else {
-            self.get_current_external_ipv6().await?
+            match self.get_current_external_ipv6().await {
+                Ok(v) => v,
+                Err(err) if ipv4.is_none() && ipv6.is_none() => return Err(err),
+                Err(err) => {
+                    // Do not return the error if we have obtained an IP already.
+                    log::debug!("{:#}", err.context("UPnP request failed"));
+                    None
+                }
+            }
         };
 
         Ok((ipv4, ipv6))

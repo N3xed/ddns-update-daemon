@@ -229,7 +229,7 @@ pub async fn main() -> anyhow::Result<()> {
                 log::info!("IP address changed: IPv4={ipv4}, IPv6={ipv6}. Updating..");
             }
             (ipv4, ipv6) => {
-                log::debug!("IP address no change:  IPv4={ipv4:?}, IPv6={ipv6:?}");
+                log::debug!("IP address no change: IPv4={ipv4:?}, IPv6={ipv6:?}");
             }
         }
 
@@ -403,9 +403,11 @@ impl IpService {
 }
 
 pub fn get_current_local_ips() -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
+    use local_ip_address::Error;
     let (ipv4, ipv6) = match local_ip_address::local_ip() {
         Ok(IpAddr::V4(ip)) => (Some(ip), None),
         Ok(IpAddr::V6(ip)) => (None, Some(ip)),
+        Err(Error::LocalIpAddressNotFound) => (None, None),
         Err(err) => {
             log::error!(
                 "{:#}",
@@ -419,9 +421,12 @@ pub fn get_current_local_ips() -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
     } else {
         match local_ip_address::local_ipv6() {
             Ok(IpAddr::V6(ip)) => Some(ip),
-            Ok(IpAddr::V4(_)) => None,
+            Ok(IpAddr::V4(_)) | Err(Error::LocalIpAddressNotFound) => None,
             Err(err) => {
-                log::error!("{err:?}");
+                log::error!(
+                    "{:#}",
+                    anyhow!(err).context("failed to query the system IP address")
+                );
                 None
             }
         }
