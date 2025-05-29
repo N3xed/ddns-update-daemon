@@ -1,10 +1,10 @@
 [package]
 name = "ddns-update-daemon"
-version = "1.0.0"
-edition = "2021"
+version = "1.0.1"
+edition = "2024"
 authors = ["Dominik Gschwind"]
 description = "DynDNS update daemon using UPnP"
-rust-version = "1.75.0"
+rust-version = "1.85.0"
 repository = "https://github.com/N3xed/ddns-update-daemon"
 license = "MIT"
 keywords = ["ddns", "upnp", "cloudflare", "dns"]
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 rupnp = "3.0.0"
 anyhow = "1.0"
-parse-display = "0.9"
+parse-display = "0.10"
 tokio = { version = "1.45", features = ["macros", "rt", "time"] }
 reqwest = { version = "0.12", features = ["json", "charset", "http2", "macos-system-configuration"], default-features = false }
 futures = "0.3"
