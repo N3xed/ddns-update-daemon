@@ -1,14 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use futures::pin_mut;
-use futures::prelude::*;
-use rupnp::ssdp::URN;
+use upnp::UPnPIpService;
 
 mod cloudflare;
+mod upnp;
 mod url;
 
 /// A daemon for updating DynDNS services when the IP address changes.
@@ -26,14 +24,39 @@ struct Args {
 }
 
 pub mod config {
-    use std::path::Path;
+    use std::{path::Path, str::FromStr};
 
     use crate::{cloudflare, url};
+
+    #[derive(Debug, Clone)]
+    pub struct Uri(pub rupnp::http::Uri);
+    impl<'de> serde::Deserialize<'de> for Uri {
+        fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            use serde::Deserialize;
+
+            let uri: String = Deserialize::deserialize(d)?;
+            match rupnp::http::Uri::from_str(&uri) {
+                Ok(uri) => Ok(Uri(uri)),
+                Err(err) => Err(serde::de::Error::custom(format!("{}", err))),
+            }
+        }
+    }
+
+    #[derive(Debug, serde::Deserialize, Clone)]
+    #[serde(untagged, expecting = "an IP address or a UPnP InternetGatewayDevice endpoint URI")]
+    pub enum Router {
+        Ip(std::net::IpAddr),
+        Uri(Uri),
+    }
 
     #[derive(Debug, serde::Deserialize)]
     pub struct Config {
         /// Optional router IP address that will be used to query the external IP address using UPnP.
-        pub router_ip: Option<std::net::IpAddr>,
+        /// May also be a URI to the UPnP InternetGatewayDevice endpoint.
+        pub router_ip: Option<Router>,
         /// The interval in minutes to check if the IP address changed.
         /// May be fractional (i.e. `0.5`).
         pub interval: f64,
@@ -50,15 +73,22 @@ pub mod config {
     impl Config {
         pub fn print(&self, path: &Path) {
             log::info!("Found config at '{}'", path.display());
-            if let Some(ip) = &self.router_ip {
-                if ip.is_loopback() {
+
+            match &self.router_ip {
+                None => {
+                    log::info!("No router_ip configured, descovering from the network.")
+                }
+                Some(Router::Ip(ip)) if ip.is_loopback() => {
                     log::info!("Found loopback as router_ip, watching local IP address instead.")
-                } else {
+                }
+                Some(Router::Ip(ip)) => {
                     log::info!("Using configured router_ip '{ip}'.")
                 }
-            } else {
-                log::info!("No router_ip configured, detecting from the network.")
+                Some(Router::Uri(Uri(uri))) => {
+                    log::info!("Using configured router_ip `{uri}` as UPnP InternetGatewayDevice endpoint.");
+                }
             }
+
             if let Some(cf) = &self.cloudflare {
                 log::info!(
                     "Found updater for cloudflare: {} DNS record(s).",
@@ -139,8 +169,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     // Discover the internet gateway device to be querried or watch the local ip
     // if loopback.
-    log::info!("Discovering internet gateway..");
-    let mut service = IpService::new(router_ip, true).await?;
+    let mut service = IpService::new(router_ip.clone(), true).await?;
 
     let (cf_auth, mut cf_updaters) = if let Some(cf) = cf {
         let updaters = cf
@@ -156,7 +185,7 @@ pub async fn main() -> anyhow::Result<()> {
     let interval = (interval * 60.0).round();
     anyhow::ensure!(
         interval >= 0.0 && interval.is_finite() && interval <= u64::MAX as f64,
-        "interval * 60 ({interval}) must be positive and less than `2^64 - 1`"
+        "interval * 60 ({interval}) must be positive and less than `2^64`"
     );
     log::info!("Using {interval} seconds interval.");
 
@@ -166,15 +195,16 @@ pub async fn main() -> anyhow::Result<()> {
     loop {
         let (next_ipv4, next_ipv6) = match service.get_current_ips().await {
             Some(v) => v,
-            None => {
-                log::info!("UPnP request failed; rediscovering internet gateway..");
+            None if service.is_upnp() => {
+                log::info!("Rediscovering internet gateway..");
                 // Try to recreate the IpService, since the previous call errored.
-                let new_service = IpService::new(config.router_ip, false).await;
-                if let Ok(new_service) = new_service {
-                    service = new_service;
+                match IpService::new(router_ip.clone(), false).await {
+                    Ok(new_service) => service = new_service,
+                    Err(err) => log::error!("{err:#}"),
                 }
                 (None, None)
             }
+            None => (None, None),
         };
 
         let ipv4_changed = curr_ipv4 != next_ipv4;
@@ -316,9 +346,17 @@ pub enum IpService {
 }
 
 impl IpService {
+    pub fn is_upnp(&self) -> bool {
+        matches!(self, Self::UPnP(_))
+    }
+
     pub async fn get_current_ips(&self) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         match self {
-            IpService::UPnP(s) => s.get_current_ips().await,
+            IpService::UPnP(s) => s
+                .get_current_ips()
+                .await
+                .map_err(|err| log::error!("{:#}", err.context("UPnP request failed")))
+                .ok(),
             IpService::Local => get_current_local_ips(),
         }
     }
@@ -326,196 +364,35 @@ impl IpService {
     /// Create an IP address service.
     /// Query local IP address if `ipaddr` is loopback otherwise use UPnP to
     /// query the router's given by `ipaddr` or the first discovered.
-    pub async fn new(ipaddr: Option<std::net::IpAddr>, verbose: bool) -> Result<Self> {
-        if ipaddr.as_ref().map(IpAddr::is_loopback).unwrap_or(false) {
+    pub async fn new(ipaddr: Option<config::Router>, verbose: bool) -> Result<Self> {
+        async fn discover(addr: Option<IpAddr>, verbose: bool) -> Result<UPnPIpService> {
             if verbose {
-                log::info!("Watching the local IP address.");
+                log::info!("Discovering internet gateway..");
             }
-            Ok(IpService::Local)
-        } else {
-            let upnp_service = UPnPIpService::new_ip_connection_service(ipaddr).await?;
-            log::info!(
-                "Using router '{}' at '{}' to get the external IP address.",
-                upnp_service.router_name(),
-                upnp_service.router_ip()
-            );
-            Ok(IpService::UPnP(upnp_service))
+            UPnPIpService::new_ip_connection_service(addr).await
         }
-    }
-}
 
-/// A service that queries the external IP address from the router using UPnP.
-pub struct UPnPIpService {
-    device: rupnp::Device,
-    service_scpd: rupnp::scpd::SCPD,
-    service: rupnp::Service,
-}
-
-impl UPnPIpService {
-    pub fn router_ip(&self) -> &str {
-        self.device.url().host().unwrap()
-    }
-
-    pub fn router_name(&self) -> &str {
-        self.device.friendly_name()
-    }
-
-    /// Get the `WANIPConnection` service from the `InternetGatewayDevice` matching `ipaddr` using
-    /// [UPnP WAN Common Interface Config](http://upnp.org/specs/gw/UPnP-gw-WANCommonInterfaceConfig-v1-Service.pdf).
-    async fn new_ip_connection_service(ipaddr: Option<std::net::IpAddr>) -> Result<UPnPIpService> {
-        const INTERNET_GATEWAY_DEVICE: URN =
-            URN::device("schemas-upnp-org", "InternetGatewayDevice", 1);
-        const WANIP_CON_SERVICE: URN = URN::service("schemas-upnp-org", "WANIPConnection", 1);
-        const WAN_DEVICE: URN = URN::device("schemas-upnp-org", "WANDevice", 1);
-        const WAN_CONNECTION_DEVICE: URN =
-            URN::device("schemas-upnp-org", "WANConnectionDevice", 1);
-
-        let devices = rupnp::discover(
-            &rupnp::ssdp::SearchTarget::URN(INTERNET_GATEWAY_DEVICE),
-            Duration::from_secs(120),
-        )
-        .await?;
-        pin_mut!(devices);
-
-        let gateway = loop {
-            let gateway = match devices.try_next().await? {
-                Some(d) => d,
-                None => bail!("could not find internet gateway device"),
-            };
-
-            log::debug!(
-                "Found gateway '{}' at '{}'",
-                gateway.friendly_name(),
-                gateway.url()
-            );
-            if let Some(gateway_ip) = &ipaddr {
-                if let Some(mut host) = gateway.url().host() {
-                    host = host.strip_prefix('[').unwrap_or(host);
-                    host = host.strip_suffix(']').unwrap_or(host);
-                    let device_ip: std::net::IpAddr = match host.parse() {
-                        Ok(s) => s,
-                        Err(err) => {
-                            let uri = gateway.url();
-                            let device_name = gateway.friendly_name();
-                            log::info!("Uri '{uri}' of discovered gateway '{device_name}' is not a valid IP address: {err:?}");
-                            continue;
-                        }
-                    };
-
-                    if device_ip == *gateway_ip {
-                        break gateway;
-                    }
+        let upnp_service = match ipaddr {
+            Some(config::Router::Ip(ip)) if ip.is_loopback() => {
+                if verbose {
+                    log::info!("Watching the local IP address.");
                 }
-            } else {
-                break gateway;
+                return Ok(IpService::Local);
+            }
+            None => discover(None, verbose).await?,
+            Some(config::Router::Ip(ip)) => discover(Some(ip), verbose).await?,
+            Some(config::Router::Uri(config::Uri(uri))) => {
+                log::debug!("Using InternetGatewayDevice URI '{}'.", uri);
+                UPnPIpService::new_from_url(uri).await?
             }
         };
 
-        let device = gateway
-            .devices_iter()
-            .find(|d| *d.device_type() == WAN_DEVICE)
-            .with_context(|| anyhow!("could not find WAN device"))?
-            .devices_iter()
-            .find(|d| *d.device_type() == WAN_CONNECTION_DEVICE)
-            .with_context(|| anyhow!("could not find WAN connection device"))?;
-
-        let service = device
-            .services_iter()
-            .find(|d| *d.service_type() == WANIP_CON_SERVICE)
-            .with_context(|| anyhow!("could not find WAN IP connection service"))?;
-
-        let service_scpd = service.scpd(gateway.url()).await?;
-
-        Ok(UPnPIpService {
-            service: service.clone(),
-            service_scpd,
-            device: gateway,
-        })
-    }
-
-    /// Get the external ip address.
-    async fn get_current_external_ip(&self) -> Result<Option<IpAddr>> {
-        const ACTION: &str = "GetExternalIPAddress";
-        const IPV4_ADDR_VAR: &str = "NewExternalIPAddress";
-
-        let response = match self.service.action(self.device.url(), ACTION, "").await {
-            Err(err) => return Err(anyhow!(err).context(format!("{ACTION} failed"))),
-            Ok(r) => r,
-        };
-
-        let Some(ip_addr_str) = response.get(IPV4_ADDR_VAR) else {
-            return Ok(None);
-        };
-        if ip_addr_str.trim().is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(ip_addr_str.parse()?))
-    }
-
-    /// Get the external IPV6 address. Currently only supported on FRITZ!Box with the
-    /// `X_AVM_DE_GetExternalIPv6Address` action.
-    async fn get_current_external_ipv6(&self) -> Result<Option<Ipv6Addr>> {
-        const ACTION: &str = "X_AVM_DE_GetExternalIPv6Address";
-        const IPV6_ADDR_VAR: &str = "NewExternalIPv6Address";
-        const VALID_LIFETIME_VAR: &str = "NewValidLifetime";
-
-        if self
-            .service_scpd
-            .actions()
-            .iter()
-            .any(|act| act.name() == ACTION)
-        {
-            return Ok(None);
-        }
-
-        let response = match self.service.action(self.device.url(), ACTION, "").await {
-            Err(err) => return Err(anyhow!(err).context(format!("{ACTION} failed"))),
-            Ok(r) => r,
-        };
-
-        let valid_lifetime = match response.get(VALID_LIFETIME_VAR) {
-            None => return Ok(None),
-            Some(v) if v.trim().is_empty() => return Ok(None),
-            Some(v) => v,
-        };
-        let ipv6_addr = match response.get(IPV6_ADDR_VAR) {
-            None => return Ok(None),
-            Some(v) if v.trim().is_empty() => return Ok(None),
-            Some(v) => v,
-        };
-
-        let valid_lifetime: u64 = valid_lifetime.parse()?;
-        if valid_lifetime == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(ipv6_addr.parse()?))
-        }
-    }
-
-    pub async fn get_current_ips(&self) -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
-        let (ipv4, ipv6) = match self.get_current_external_ip().await {
-            Ok(Some(IpAddr::V4(ip))) => (Some(ip), None),
-            Ok(Some(IpAddr::V6(ip))) => (None, Some(ip)),
-            Ok(None) => (None, None),
-            Err(err) => {
-                log::error!("{err:?}");
-                return None;
-            }
-        };
-        let ipv6 = if ipv6.is_some() {
-            ipv6
-        } else {
-            match self.get_current_external_ipv6().await {
-                Ok(ip) => ip,
-                Err(err) => {
-                    log::error!("{err:?}");
-                    return None;
-                }
-            }
-        };
-
-        Some((ipv4, ipv6))
+        log::info!(
+            "Using router '{}' at '{}' to get the external IP address.",
+            upnp_service.router_name(),
+            upnp_service.router_ip()
+        );
+        Ok(IpService::UPnP(upnp_service))
     }
 }
 
@@ -524,7 +401,10 @@ pub fn get_current_local_ips() -> Option<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         Ok(IpAddr::V4(ip)) => (Some(ip), None),
         Ok(IpAddr::V6(ip)) => (None, Some(ip)),
         Err(err) => {
-            log::error!("{err:?}");
+            log::error!(
+                "{:#}",
+                anyhow!(err).context("failed to query the system IP address")
+            );
             (None, None)
         }
     };
